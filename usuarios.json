@@ -1,0 +1,25 @@
+{
+  "556992806053@s.whatsapp.net": {
+    "nome": "Adeilton lima",
+    "autenticado": true,
+    "codigo": null,
+    "usosHoje": 0,
+    "ultimoUso": "2025-05-13",
+    "optouAutenticacao": "autenticado"
+  },
+  "556999771822@s.whatsapp.net": {
+    "nome": "Geniffer",
+    "autenticado": false,
+    "codigo": "443388",
+    "usosHoje": 1,
+    "ultimoUso": "2025-05-12"
+  },
+  "556992469206": {
+    "nome": null,
+    "autenticado": true,
+    "codigo": null,
+    "usosHoje": 2,
+    "ultimoUso": "2025-05-13",
+    "optouAutenticacao": "autenticado"
+  }
+}

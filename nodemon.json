@@ -1,0 +1,13 @@
+{
+  "watch": [
+    "."
+  ],
+  "ignore": [
+    "downloads/*",
+    "auth_info_baileys/*",
+    "usuarios.json"
+  ],
+  "env": {
+    "GOOGLE_APPLICATION_CREDENTIALS": "./google-credentials.json"
+  }
+}
