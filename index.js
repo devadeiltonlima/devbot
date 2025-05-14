@@ -1,4 +1,5 @@
 // Importações principais
+const crypto = require('crypto');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const pino = require('pino');
