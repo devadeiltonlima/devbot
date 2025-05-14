@@ -16,6 +16,28 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 const { spawn } = require('child_process');
 const path = require('path');
 const { transcreverAudio } = require('./google-speech');
+const tempDir = path.join(__dirname, 'temp');
+
+// Cria o diretório temp se não existir
+fs.ensureDirSync(tempDir);
+
+// Limpa o diretório temp a cada hora
+setInterval(async () => {
+    try {
+        const files = await fs.readdir(tempDir);
+        for (const file of files) {
+            const filePath = path.join(tempDir, file);
+            const stats = await fs.stat(filePath);
+            const age = Date.now() - stats.mtimeMs;
+            // Remove arquivos com mais de 1 hora
+            if (age > 3600000) {
+                await fs.remove(filePath);
+            }
+        }
+    } catch (error) {
+        console.error('Erro ao limpar diretório temp:', error);
+    }
+}, 3600000); // 1 hora
 
 // Função para processar TikTok usando Python
 async function processarTikTok(url, tipo = 'video') {

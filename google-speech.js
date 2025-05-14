@@ -15,16 +15,20 @@ const client = new speech.SpeechClient();
 const storage = new Storage();
 const bucketName = 'adeilton-bot-audio';
 
+// Sistema de fila e controle de concorrência
+const transcriptionQueue = [];
+const maxConcurrentTranscriptions = 3; // Número máximo de transcrições simultâneas
+let activeTranscriptions = 0;
+
 /**
  * Faz upload do arquivo para o Google Cloud Storage
- * @param {string} filePath - Caminho do arquivo local
+ * @param {string} filePath - Caminho do arquivo local 
  * @returns {Promise<string>} - URI do arquivo no GCS
  */
 async function uploadToGCS(filePath) {
-    const fileName = `audio_${Date.now()}.ogg`;
+    const fileName = `audio_${Date.now()}_${Math.random().toString(36).substring(7)}.ogg`;
     
     try {
-        // Upload direto para o bucket existente
         await storage.bucket(bucketName).upload(filePath, {
             destination: fileName,
             metadata: {
@@ -53,14 +57,40 @@ async function deleteFromGCS(gcsUri) {
 }
 
 /**
- * Transcreve um arquivo de áudio usando o Google Cloud Speech-to-Text
- * @param {Buffer} audioBuffer - Buffer contendo o áudio a ser transcrito
- * @param {Object} events - Objeto com funções de callback para eventos
+ * Processa um item da fila de transcrição
+ */
+async function processNextInQueue() {
+    if (transcriptionQueue.length === 0 || activeTranscriptions >= maxConcurrentTranscriptions) {
+        return;
+    }
+
+    activeTranscriptions++;
+    const task = transcriptionQueue.shift();
+
+    try {
+        const result = await processTranscription(task.audioBuffer, task.events);
+        task.resolve(result);
+    } catch (error) {
+        task.reject(error);
+    } finally {
+        activeTranscriptions--;
+        // Processa o próximo item da fila se houver
+        process.nextTick(processNextInQueue);
+    }
+}
+
+/**
+ * Processa a transcrição de um áudio
+ * @param {Buffer} audioBuffer - Buffer do áudio
+ * @param {Object} events - Eventos de callback
  * @returns {Promise<string>} - Texto transcrito
  */
-async function transcreverAudio(audioBuffer, events = {}) {
-    const tempInputFile = './temp_input.opus';
-    const tempOutputFile = './temp_audio.ogg';
+async function processTranscription(audioBuffer, events = {}) {
+    const tempDir = path.join(__dirname, 'temp');
+    const tempInputFile = path.join(tempDir, `input_${Date.now()}_${Math.random().toString(36).substring(7)}.opus`);
+    const tempOutputFile = path.join(tempDir, `output_${Date.now()}_${Math.random().toString(36).substring(7)}.ogg`);
+    
+    await fs.ensureDir(tempDir);
     let gcsUri = null;
     
     try {
@@ -68,69 +98,102 @@ async function transcreverAudio(audioBuffer, events = {}) {
         
         if (events.onStart) await events.onStart();
         
-        // Salva o buffer em arquivo temporário
         await fs.writeFile(tempInputFile, audioBuffer);
         
         if (events.onConvert) await events.onConvert();
         
-        // Converte o áudio para o formato correto
         await new Promise((resolve, reject) => {
             ffmpeg(tempInputFile)
-                .toFormat('opus')
+                .toFormat('ogg')
                 .audioCodec('libopus')
                 .audioChannels(1)
                 .audioFrequency(48000)
+                .outputOptions([
+                    '-c:a libopus',
+                    '-b:a 128k',
+                    '-application voip'
+                ])
                 .on('end', resolve)
                 .on('error', reject)
                 .save(tempOutputFile);
         });
         
-        // Verifica o tamanho do arquivo
         const stats = await fs.stat(tempOutputFile);
         const fileSizeInMB = stats.size / (1024 * 1024);
         console.log(`Tamanho do arquivo: ${fileSizeInMB.toFixed(2)}MB`);
 
-        // Configuração base para o reconhecimento
         const config = {
-            encoding: 'WEBM_OPUS',
+            encoding: 'OGG_OPUS',
             sampleRateHertz: 48000,
             audioChannelCount: 1,
             enableAutomaticPunctuation: true,
             languageCode: 'pt-BR',
             model: 'latest_long',
-            useEnhanced: true
+            useEnhanced: true,
+            enableWordTimeOffsets: true,
+            profanityFilter: false,
+            enableWordConfidence: true
         };
 
         let transcricao;
         
-        // Para áudios longos, usa o GCS e longRunningRecognize
         if (fileSizeInMB > 0.5) {
             console.log('Áudio longo detectado, usando upload para GCS...');
             
             if (events.onUpload) await events.onUpload();
             
-            // Faz upload do arquivo para o GCS
-            gcsUri = await uploadToGCS(tempOutputFile);
-            console.log('Arquivo enviado para GCS:', gcsUri);
-            
-            if (events.onProcess) await events.onProcess();
-            
-            // Configura a requisição com o URI do GCS
-            const request = {
-                audio: { uri: gcsUri },
-                config: config
-            };
+            try {
+                let retries = 3;
+                while (retries > 0) {
+                    try {
+                        gcsUri = await uploadToGCS(tempOutputFile);
+                        console.log('Arquivo enviado para GCS:', gcsUri);
+                        break;
+                    } catch (error) {
+                        retries--;
+                        if (retries === 0) throw error;
+                        console.log(`Tentando upload novamente. Tentativas restantes: ${retries}`);
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+                
+                if (events.onProcess) await events.onProcess();
+                
+                const request = {
+                    audio: { uri: gcsUri },
+                    config: config
+                };
 
-            // Inicia a operação de longa duração
-            const [operation] = await client.longRunningRecognize(request);
-            console.log('Aguardando conclusão da transcrição...');
-            const [response] = await operation.promise();
-            
-            transcricao = response.results
-                .map(result => result.alternatives[0].transcript)
-                .join('\n');
+                const [operation] = await client.longRunningRecognize(request);
+                console.log('Aguardando conclusão da transcrição...');
+                
+                const timeoutPromise = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('Timeout na transcrição')), 300000);
+                });
+                
+                const [response] = await Promise.race([
+                    operation.promise(),
+                    timeoutPromise
+                ]);
+                
+                if (!response?.results?.length) {
+                    throw new Error('Nenhum resultado encontrado na transcrição');
+                }
+                
+                transcricao = response.results
+                    .filter(result => result?.alternatives?.[0]?.transcript)
+                    .map(result => result.alternatives[0].transcript)
+                    .join('\n');
+                    
+                if (!transcricao) {
+                    throw new Error('Transcrição retornou vazia');
+                }
+                
+            } catch (error) {
+                console.error('Erro específico na transcrição:', error);
+                throw error;
+            }
         } else {
-            // Para áudios curtos, usa reconhecimento síncrono
             console.log('Áudio curto detectado, usando reconhecimento síncrono...');
             const audioBytes = await fs.readFile(tempOutputFile);
             const request = {
@@ -139,14 +202,23 @@ async function transcreverAudio(audioBuffer, events = {}) {
             };
             
             const [response] = await client.recognize(request);
+            
+            if (!response?.results?.length) {
+                throw new Error('Nenhum resultado encontrado na transcrição');
+            }
+            
             transcricao = response.results
+                .filter(result => result?.alternatives?.[0]?.transcript)
                 .map(result => result.alternatives[0].transcript)
                 .join('\n');
+                
+            if (!transcricao) {
+                throw new Error('Transcrição retornou vazia');
+            }
         }
 
         if (events.onComplete) await events.onComplete();
 
-        // Limpa os arquivos
         await fs.remove(tempInputFile);
         await fs.remove(tempOutputFile);
         if (gcsUri) {
@@ -159,7 +231,6 @@ async function transcreverAudio(audioBuffer, events = {}) {
     } catch (error) {
         console.error('Erro ao transcrever áudio:', error);
         
-        // Limpa os arquivos em caso de erro
         try {
             await fs.remove(tempInputFile);
             await fs.remove(tempOutputFile);
@@ -170,17 +241,41 @@ async function transcreverAudio(audioBuffer, events = {}) {
             console.error('Erro ao limpar arquivos:', cleanupError);
         }
         
-        // Retorna mensagens de erro mais amigáveis
-        if (error.code === 7) {
+        if (error.message === 'Timeout na transcrição') {
+            throw new Error('A transcrição está demorando muito. Por favor, tente novamente com um áudio menor.');
+        } else if (error.message === 'Nenhum resultado encontrado na transcrição' || error.message === 'Transcrição retornou vazia') {
+            throw new Error('Não foi possível reconhecer o áudio. Verifique se o áudio está claro e tente novamente.');
+        } else if (error.code === 7) {
             throw new Error('O áudio é muito longo. Por favor, envie um áudio mais curto.');
         } else if (error.code === 3 && error.details?.includes('audio exceeds')) {
             throw new Error('Processando áudio longo, aguarde um momento...');
         } else if (error.code === 'ENOENT') {
             throw new Error('Erro ao processar o arquivo de áudio. Tente novamente.');
         } else {
+            console.error('Erro detalhado:', error);
             throw new Error('Ocorreu um erro ao transcrever o áudio. Por favor, tente novamente.');
         }
     }
+}
+
+/**
+ * Função principal que gerencia a fila de transcrição
+ * @param {Buffer} audioBuffer - Buffer do áudio a ser transcrito
+ * @param {Object} events - Eventos de callback
+ * @returns {Promise<string>} - Texto transcrito
+ */
+async function transcreverAudio(audioBuffer, events = {}) {
+    return new Promise((resolve, reject) => {
+        transcriptionQueue.push({
+            audioBuffer,
+            events,
+            resolve,
+            reject
+        });
+        
+        // Inicia o processamento se possível
+        processNextInQueue();
+    });
 }
 
 module.exports = {
